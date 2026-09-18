@@ -193,15 +193,22 @@ def best_pair() -> str | None:
 
 
 def apply_pair(state: dict) -> None:
-    """In auto mode, follow screener's top pick. Never switch while in a position."""
-    if CFG["PAIR_MODE"] != "auto" or state["position"] is not None:
+    """Auto mode: rotate to screener top. Sell first, buy next cycle (cash between)."""
+    if CFG["PAIR_MODE"] != "auto":
         return
     top = best_pair()
-    if top and top != CFG["PAIR"]:
-        print(f"[auto] switch {CFG['PAIR']} -> {top}")
-        CFG["PAIR"] = top
-        base = top[: -len("idr") - 1]
-        CFG["SIGNAL_SYMBOL"] = f"{base.upper()}USDT"
+    if not top:
+        return
+    if state["position"] is None:
+        target = state.pop("rotate_to", None) or top
+        if target != CFG["PAIR"]:
+            print(f"[auto] switch {CFG['PAIR']} -> {target}")
+            CFG["PAIR"] = target
+            base = target[: -len("idr") - 1]
+            CFG["SIGNAL_SYMBOL"] = f"{base.upper()}USDT"
+    elif top != CFG["PAIR"]:
+        state["rotate_to"] = top
+        print(f"[auto] queued rotate {CFG['PAIR']} -> {top} (sell first)")
 
 
 def get_price(pair: str) -> float:
@@ -326,6 +333,8 @@ def step(state: dict) -> None:
         sell(price, "CUT LOSS", state)
     elif CFG["TAKE_PROFIT_PCT"] > 0 and price >= entry * (1 + CFG["TAKE_PROFIT_PCT"] / 100):
         sell(price, "TAKE PROFIT", state)
+    elif "rotate_to" in state:
+        sell(price, "rotate", state)
     elif sig["action"] == "SELL":
         sell(price, sig["reason"], state)
 

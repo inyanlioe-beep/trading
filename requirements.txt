@@ -1,4 +1,4 @@
-fastapi
-uvicorn
-pandas
-httpx
+fastapi>=0.141.1
+uvicorn>=0.52.4
+pandas>=3.0.5
+httpx>=0.28.1

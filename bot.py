@@ -275,13 +275,15 @@ def buy(price: float, reason: str, state: dict, pair: str) -> None:
         check_funds(qty, price, fee)
         indodax_order(pair, "buy", price, qty)
 
+    now = time.time()
     state["positions"][pair] = {
-        "entry_price": price, "qty": qty, "entry_time": time.time(),
+        "entry_price": price, "qty": qty, "entry_time": now,
+        "entry_time_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
         "reason": reason, "fee_paid_idr": qty * price * fee,
         "pair": pair,
     }
     if CFG["PAPER"]:
-        state["trades"].append({"side": "BUY", "price": price, "qty": qty, "time": time.time(), "reason": reason, "pair": pair})
+        state["trades"].append({"side": "BUY", "price": price, "qty": qty, "time": now, "time_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "reason": reason, "pair": pair})
     print(f"[BUY{' PAPER' if CFG['PAPER'] else ''}] {pair} {qty:.8f} @ {price:,.0f} "
           f"= {qty * price:,.0f} IDR — {reason}")
 
@@ -303,8 +305,9 @@ def sell(price: float, reason: str, state: dict, pair: str) -> None:
     pnl = gross - fees
     pnl_pct = (price / pos["entry_price"] - 1) * 100
     state["pnl_idr"] += pnl
+    now = time.time()
     if CFG["PAPER"]:
-        state["trades"].append({"side": "SELL", "price": price, "qty": qty, "time": time.time(), "reason": reason, "pair": pair})
+        state["trades"].append({"side": "SELL", "price": price, "qty": qty, "time": now, "time_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "reason": reason, "pair": pair})
     del state["positions"][pair]
     print(f"[SELL{' PAPER' if CFG['PAPER'] else ''}] {pair} {qty:.8f} @ {price:,.0f} — {reason} | "
           f"PnL {pnl:+,.0f} IDR ({pnl_pct:+.2f}%) after fees {fees:,.0f}")

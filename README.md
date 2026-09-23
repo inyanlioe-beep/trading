@@ -66,12 +66,13 @@ Config dari `.env` (lihat `.env.example`). Env OS menang atas `.env`.
 | Var | Default | Arti |
 |---|---|---|
 | `PAPER` | `true` | `false` = order nyata (perlu `INDODAX_KEY`/`INDODAX_SECRET`) |
-| `PAIR` | `btc_idr` | Market Indodax |
+| `PAIR` | `btc_idr` | Market Indodax; comma-separated untuk banyak coin (mis. `btc_idr,eth_idr`) |
 | `PAIR_MODE` | `manual` | `auto` = ikut pair teratas screener |
 | `INTERVAL` | `1h` | Timeframe sinyal |
 | `CUT_LOSS_PCT` | `3.0` | Jual paksa di bawah entry |
 | `TAKE_PROFIT_PCT` | `6.0` | Jual paksa di atas entry; `0` = mati |
-| `BUDGET_IDR` | `1000000` | Ukuran order per beli |
+| `BUDGET_IDR` | `1000000` | Ukuran order per posisi |
+| `MAX_POSITIONS` | `3` | Maksimum coin yang dipegang bersamaan |
 | `POLL_SECONDS` | `30` | Jeda antar siklus |
 | `STATE_FILE` | `paper_state.json` | File state |
 | `SCAN_MIN_SCORE` | `6` | Skor `>=` ini → BUY |
@@ -85,7 +86,8 @@ Config dari `.env` (lihat `.env.example`). Env OS menang atas `.env`.
 - `false` untuk `PAPER` = order nyata. Uang bisa hilang.
 - Bot berhenti saat pair dalam maintenance/suspended.
 - Beli ditolak bila saldo IDR kurang atau order di bawah minimum pair.
-- Mode `auto` hanya pindah pair saat posisi kosong.
+- Mode `auto` membeli top-N pair dari screener sampai `MAX_POSITIONS`.
+- Mode `manual` dengan multi-pair akan memantau dan trading setiap pair yang dikonfigurasi.
 - Sinyal gagal ambil data → NEUTRAL, bot tidak menebak.
 
 ## Catatan

@@ -6,12 +6,13 @@ Config: read from .env in this folder (see .env.example). Real OS env vars overr
 
 Env vars:
   PAPER            true|false          (default true)
-  PAIR             btc_idr             (Indodax market)
+  PAIR             btc_idr             (Indodax market; comma-separated for multiple, e.g. btc_idr,eth_idr)
     SIGNAL_SYMBOL    BTCUSDT             (unused when the screener drives the signal)
     INTERVAL         1h
     CUT_LOSS_PCT     3.0                 (force sell below entry)
     TAKE_PROFIT_PCT  6.0                 (force sell above entry; 0 = off)
-    BUDGET_IDR       1000000
+    BUDGET_IDR       1000000             (per position)
+    MAX_POSITIONS    3                   (max simultaneous coins)
     POLL_SECONDS     30
     STATE_FILE       paper_state.json
     MIN_ORDER_IDR    10000                (fallback if pair metadata unreachable)
@@ -118,6 +119,7 @@ CFG = {
     "CUT_LOSS_PCT": float(os.getenv("CUT_LOSS_PCT", "3.0")),
     "TAKE_PROFIT_PCT": float(os.getenv("TAKE_PROFIT_PCT", "6.0")),
     "BUDGET_IDR": float(os.getenv("BUDGET_IDR", "1000000")),
+    "MAX_POSITIONS": int(os.getenv("MAX_POSITIONS", "3")),
     "POLL_SECONDS": float(os.getenv("POLL_SECONDS", "30")),
     "STATE_FILE": os.getenv("STATE_FILE", "paper_state.json"),
     "MIN_ORDER_IDR": float(os.getenv("MIN_ORDER_IDR", "10000")),
@@ -138,13 +140,15 @@ def validate_cfg() -> None:
     assert 0 < CFG["CUT_LOSS_PCT"] < 100, "CUT_LOSS_PCT must be 0..100"
     assert 0 <= CFG["TAKE_PROFIT_PCT"] < 100, "TAKE_PROFIT_PCT must be 0..100"
     assert CFG["BUDGET_IDR"] > 0, "BUDGET_IDR must be positive"
+    assert CFG["MAX_POSITIONS"] >= 1, "MAX_POSITIONS must be >= 1"
     assert CFG["MIN_ORDER_IDR"] > 0, "MIN_ORDER_IDR must be positive"
     assert 0 <= CFG["FEE_TAKER"] < 1, "FEE_TAKER must be 0..1"
     assert CFG["POLL_SECONDS"] >= 5, "POLL_SECONDS must be >= 5"
     if not CFG["PAPER"]:
         assert os.getenv("INDODAX_KEY") and os.getenv("INDODAX_SECRET"), \
             "live mode needs INDODAX_KEY and INDODAX_SECRET"
-        ensure_liquid(CFG["PAIR"])
+        for p in manual_pairs():
+            ensure_liquid(p)
     assert CFG["PAIR_MODE"] in ("manual", "auto"), "PAIR_MODE must be manual or auto"
     assert CFG["SCAN_SELL_SCORE"] < CFG["SCAN_MIN_SCORE"], \
         "SCAN_SELL_SCORE must be below SCAN_MIN_SCORE (no overlap => no flip-flop)"
@@ -170,11 +174,10 @@ def market_signal(pair: str) -> dict:
     score = r["score"]
     return {"action": score_action(score), "reason": f"score {score} [{r['reasons'][:60]}]", "score": score}
 
-def best_pair() -> str | None:
-    """Highest-score liquid pair from screener. Cached SCAN_REFRESH seconds.
+def best_pairs() -> list[dict] | None:
+    """Highest-score liquid pairs from screener. Cached SCAN_REFRESH seconds.
 
-    Safety: switch requires flat position and non-empty results; otherwise None
-    (bot keeps current pair and simply waits).
+    Safety: returns None (empty results) => bot keeps current positions and waits.
     """
     now = time.time()
     if not _scan_cache["top"] or now - _scan_cache["at"] >= CFG["SCAN_REFRESH"]:
@@ -188,27 +191,7 @@ def best_pair() -> str | None:
         print(f"[scan] {len(results)} pair lolos (score>={CFG['SCAN_MIN_SCORE']}, "
               f"vol>={CFG['SCAN_MIN_VR']}x) | top: "
               + (", ".join(f"{r['pair']}({r['score']})" for r in results[:3]) or "tidak ada"))
-    top = _scan_cache["top"]
-    return top[0]["pair"] if top else None
-
-
-def apply_pair(state: dict) -> None:
-    """Auto mode: rotate to screener top. Sell first, buy next cycle (cash between)."""
-    if CFG["PAIR_MODE"] != "auto":
-        return
-    top = best_pair()
-    if not top:
-        return
-    if state["position"] is None:
-        target = state.pop("rotate_to", None) or top
-        if target != CFG["PAIR"]:
-            print(f"[auto] switch {CFG['PAIR']} -> {target}")
-            CFG["PAIR"] = target
-            base = target[: -len("idr") - 1]
-            CFG["SIGNAL_SYMBOL"] = f"{base.upper()}USDT"
-    elif top != CFG["PAIR"]:
-        state["rotate_to"] = top
-        print(f"[auto] queued rotate {CFG['PAIR']} -> {top} (sell first)")
+    return _scan_cache["top"] or None
 
 
 def get_price(pair: str) -> float:
@@ -246,12 +229,22 @@ def indodax_order(pair: str, side: str, price: float, amount: float) -> dict:
     return out["return"]
 
 
+def active_pairs(state: dict) -> list[str]:
+    return list(state.get("positions", {}).keys())
+
+def pair_budget_free(state: dict) -> bool:
+    return len(active_pairs(state)) < CFG["MAX_POSITIONS"]
+
 def load_state() -> dict:
     try:
         with open(CFG["STATE_FILE"]) as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"position": None, "pnl_idr": 0.0, "trades": []}
+            s = json.load(f)
+        s.setdefault("positions", {})
+        s.setdefault("pnl_idr", 0.0)
+        s.setdefault("trades", [])
+        return s
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"positions": {}, "pnl_idr": 0.0, "trades": []}
 
 
 def save_state(state: dict) -> None:
@@ -259,8 +252,10 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
-def buy(price: float, reason: str, state: dict) -> None:
-    pair = CFG["PAIR"]
+def buy(price: float, reason: str, state: dict, pair: str) -> None:
+    if not pair_budget_free(state):
+        print(f"[skip BUY {pair}] max positions {CFG['MAX_POSITIONS']} reached")
+        return
     meta = pair_meta(pair)
     fee = meta["fee"] or CFG["FEE_TAKER"]
     budget = CFG["BUDGET_IDR"]
@@ -280,28 +275,28 @@ def buy(price: float, reason: str, state: dict) -> None:
         check_funds(qty, price, fee)
         indodax_order(pair, "buy", price, qty)
 
-    state["position"] = {
+    state["positions"][pair] = {
         "entry_price": price, "qty": qty, "entry_time": time.time(),
         "reason": reason, "fee_paid_idr": qty * price * fee,
-        "pair": CFG["PAIR"],
+        "pair": pair,
     }
     if CFG["PAPER"]:
-        state["trades"].append({"side": "BUY", "price": price, "qty": qty, "time": time.time(), "reason": reason})
-    print(f"[BUY{' PAPER' if CFG['PAPER'] else ''}] {qty:.8f} @ {price:,.0f} "
+        state["trades"].append({"side": "BUY", "price": price, "qty": qty, "time": time.time(), "reason": reason, "pair": pair})
+    print(f"[BUY{' PAPER' if CFG['PAPER'] else ''}] {pair} {qty:.8f} @ {price:,.0f} "
           f"= {qty * price:,.0f} IDR — {reason}")
 
 
-def sell(price: float, reason: str, state: dict) -> None:
-    pos = state["position"]
-    meta = pair_meta(CFG["PAIR"])
+def sell(price: float, reason: str, state: dict, pair: str) -> None:
+    pos = state["positions"][pair]
+    meta = pair_meta(pair)
     fee = meta["fee"] or CFG["FEE_TAKER"]
     qty = round_qty(pos["qty"], meta["qty_step"])
     if qty <= 0:
         raise RuntimeError(f"sell qty rounds to zero (pos {pos['qty']}, step {meta['qty_step']})")
 
     if not CFG["PAPER"]:
-        ensure_liquid(CFG["PAIR"])
-        indodax_order(CFG["PAIR"], "sell", price, qty)
+        ensure_liquid(pair)
+        indodax_order(pair, "sell", price, qty)
 
     gross = (price - pos["entry_price"]) * qty
     fees = pos.get("fee_paid_idr", pos["entry_price"] * qty * fee) + price * qty * fee
@@ -309,41 +304,78 @@ def sell(price: float, reason: str, state: dict) -> None:
     pnl_pct = (price / pos["entry_price"] - 1) * 100
     state["pnl_idr"] += pnl
     if CFG["PAPER"]:
-        state["trades"].append({"side": "SELL", "price": price, "qty": qty, "time": time.time(), "reason": reason})
-    state["position"] = None
-    print(f"[SELL{' PAPER' if CFG['PAPER'] else ''}] {qty:.8f} @ {price:,.0f} — {reason} | "
+        state["trades"].append({"side": "SELL", "price": price, "qty": qty, "time": time.time(), "reason": reason, "pair": pair})
+    del state["positions"][pair]
+    print(f"[SELL{' PAPER' if CFG['PAPER'] else ''}] {pair} {qty:.8f} @ {price:,.0f} — {reason} | "
           f"PnL {pnl:+,.0f} IDR ({pnl_pct:+.2f}%) after fees {fees:,.0f}")
 
 
-def step(state: dict) -> None:
-    apply_pair(state)
-    price = get_price(CFG["PAIR"])
-    sig = market_signal(CFG["PAIR"])
-    pos = state["position"]
+def manual_pairs() -> list[str]:
+    """Parse comma-separated PAIR config into list."""
+    return [p.strip() for p in CFG["PAIR"].split(",") if p.strip()]
 
-    print(f"[{time.strftime('%H:%M:%S')}] {CFG['PAIR']} {price:,.0f} | {sig['action']} — {sig['reason']}")
+def step(state: dict) -> None:
+    if CFG["PAIR_MODE"] == "auto":
+        _step_auto(state)
+        return
+    for pair in manual_pairs():
+        _step_pair(pair, state)
+
+def _step_pair(pair: str, state: dict) -> None:
+    try:
+        price = get_price(pair)
+    except Exception as e:
+        print(f"[{pair}] price error: {e}")
+        return
+    sig = market_signal(pair)
+    pos = state["positions"].get(pair)
+
+    print(f"[{time.strftime('%H:%M:%S')}] {pair} {price:,.0f} | {sig['action']} — {sig['reason']}")
 
     if pos is None:
         if sig["action"] == "BUY":
-            buy(price, sig["reason"], state)
+            buy(price, sig["reason"], state, pair)
         return
 
     entry = pos["entry_price"]
     if price <= entry * (1 - CFG["CUT_LOSS_PCT"] / 100):
-        sell(price, "CUT LOSS", state)
+        sell(price, "CUT LOSS", state, pair)
     elif CFG["TAKE_PROFIT_PCT"] > 0 and price >= entry * (1 + CFG["TAKE_PROFIT_PCT"] / 100):
-        sell(price, "TAKE PROFIT", state)
-    elif "rotate_to" in state:
-        sell(price, "rotate", state)
+        sell(price, "TAKE PROFIT", state, pair)
     elif sig["action"] == "SELL":
-        sell(price, sig["reason"], state)
+        sell(price, sig["reason"], state, pair)
+
+def _step_auto(state: dict) -> None:
+    """Auto mode: manage exits for held pairs, then buy screener top up to MAX_POSITIONS."""
+    for pair in list(active_pairs(state)):
+        _step_pair(pair, state)
+    if not pair_budget_free(state):
+        return
+    top = best_pairs()
+    if not top:
+        return
+    held = set(active_pairs(state))
+    for r in top:
+        if not pair_budget_free(state):
+            break
+        pair = r["pair"]
+        if pair in held:
+            continue
+        try:
+            price = get_price(pair)
+            buy(price, f"score {r['score']} [{r['reasons'][:60]}]", state, pair)
+            held.add(pair)
+        except Exception as e:
+            print(f"[auto BUY {pair}] error: {e}")
 
 
 def main() -> None:
     validate_cfg()
     state = load_state()
-    print(f"PAPER={CFG['PAPER']} pair={CFG['PAIR']} cut_loss={CFG['CUT_LOSS_PCT']}% "
-          f"take_profit={CFG['TAKE_PROFIT_PCT']}% budget={CFG['BUDGET_IDR']:,.0f}")
+    pairs_str = ", ".join(manual_pairs()) if CFG["PAIR_MODE"] == "manual" else "auto"
+    print(f"PAPER={CFG['PAPER']} pairs={pairs_str} max_positions={CFG['MAX_POSITIONS']} "
+          f"cut_loss={CFG['CUT_LOSS_PCT']}% take_profit={CFG['TAKE_PROFIT_PCT']}% "
+          f"budget={CFG['BUDGET_IDR']:,.0f}/pos")
     if "--once" in sys.argv:
         step(state)
         save_state(state)
@@ -363,23 +395,31 @@ if __name__ == "__main__":
         assert score_action(CFG["SCAN_SELL_SCORE"]) == "SELL"
         assert score_action((CFG["SCAN_MIN_SCORE"] + CFG["SCAN_SELL_SCORE"]) / 2) == "NEUTRAL"
         _pairs_cache["all"] = {
-            CFG["PAIR"]: {
+            "btc_idr": {
                 "trade_min_base_currency": 10000,
                 "trade_fee_percent_taker": 0.2,
                 "quantity_increment": 1e-8,
-            }
+            },
+            "eth_idr": {
+                "trade_min_base_currency": 10000,
+                "trade_fee_percent_taker": 0.2,
+                "quantity_increment": 1e-8,
+            },
         }
         assert abs(round_qty(1.234567891, 1e-8) - 1.23456789) < 1e-12
         assert round_qty(1.999999999, 1e-8) == 1.99999999
-        state = {"position": None, "pnl_idr": 0.0, "trades": []}
-        buy(1_000_000.0, "test", state)
-        pos = state["position"]
+        state = {"positions": {}, "pnl_idr": 0.0, "trades": []}
+        buy(1_000_000.0, "test", state, "btc_idr")
+        pos = state["positions"]["btc_idr"]
         assert pos is not None and pos["qty"] > 0, "buy must set a positive qty"
         assert pos["qty"] * 1_000_000.0 >= 10000, "order value below min"
-        sell(1_060_000.0, "TAKE PROFIT", state)
-        assert state["position"] is None, "sell must clear position"
+        buy(5_000_000.0, "test2", state, "eth_idr")
+        assert len(state["positions"]) == 2, "should hold 2 positions"
+        sell(1_060_000.0, "TAKE PROFIT", state, "btc_idr")
+        assert "btc_idr" not in state["positions"], "sell must clear position"
+        assert "eth_idr" in state["positions"], "eth position should remain"
         assert state["pnl_idr"] > 0, "winning trade must be profitable after fee"
-        assert len(state["trades"]) == 2, "one buy + one sell recorded"
+        assert len(state["trades"]) == 3, "two buys + one sell recorded"
         print("bot selftest ok")
     else:
         main()
